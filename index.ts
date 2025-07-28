@@ -1,5 +1,5 @@
 import Context, { AuthenticatedPrincipal } from "./helpers/HTTP/Request/Context";
-import { serve, FileSystemRouter, type Serve } from "bun";
+import { serve, FileSystemRouter, type Serve, type Server } from "bun";
 import { config } from "./src/core/config";
 import Pocketbase from "pocketbase";
 import path from "path";
@@ -11,6 +11,9 @@ import crypto from "crypto";
 import * as z from "zod";
 import { watch } from "fs";
 import { pathToFileURL } from "url";
+
+// --- Global server instance ---
+let server: Server;
 
 // --- Validation: Ensure required config vars are present ---
 if (!config.Clover_Secret || !config.Clover_Tenant_ID) {
@@ -25,124 +28,156 @@ if (!config.ADMIN_EMAIL || !config.ADMIN_PASSWORD) {
 
 // --- Pocketbase Connection ---
 const pb = new Pocketbase(config.DatabaseUrl);
-
-// --- FileSystem Router Setup ---
-const router = new FileSystemRouter({
-  style: "nextjs",
-  dir: path.join(process.cwd(), "routes"),
-});
-
 try {
   await pb.collection("_superusers").authWithPassword(config.ADMIN_EMAIL, config.ADMIN_PASSWORD);
 } catch (_) {}
 
+// --- Primary Tenant Data ---
 const primaryTenantData = await fetch(`${config.Clover_Server_Url}/tenants/${config.Clover_Tenant_ID}`, {
   headers: { Authorization_Secret: config.Clover_Secret },
 }).then(async (res) => {
   if (!res.ok) throw new Error(`Failed to fetch primary tenant data: ${res.status} ${res.statusText}`);
   return res.json();
 });
-
 console.log("✅ Primary tenant data loaded.");
 
-const routeHandlers = new Map<string, (ctx: Context, db: DatabaseService) => Promise<Response>>();
-const schemas = new Map();
-const middlewares = new Map<string, (ctx: Context) => Promise<Response | boolean>>();
-
-const routeVersions = new Map<string, number>();
-function bustModulePath(modulePath: string, key: string): string {
-  const version = (routeVersions.get(key) ?? 0) + 1;
-  routeVersions.set(key, version);
-  return `${pathToFileURL(modulePath).href}?t=${version}`;
-}
-
-async function loadRoutes() {
-  for (const [pathname, routePath] of Object.entries(router.routes)) {
-    const routeModule = await import(bustModulePath(routePath as string, pathname));
-
-    const schemaPath = path.join(process.cwd(), "schemas", pathname, "index.ts");
-    const middlewarePath = path.join(process.cwd(), "routes", pathname, "middleware.ts");
-
-    if (!routeModule.default) {
-      console.error(`❌ Route must export default handler: ${routePath}`);
-      process.exit(1);
-    }
-
-    if (await Bun.file(schemaPath).exists()) {
-      const schema = await import(bustModulePath(schemaPath, pathname + "-schema"));
-      if (!schema.default) {
-        console.error(`❌ Schema must export default: ${schemaPath}`);
-        process.exit(1);
-      }
-      schemas.set(pathname, schema.default);
-    }
-
-    if (await Bun.file(middlewarePath).exists()) {
-      const middleware = await import(bustModulePath(middlewarePath, pathname + "-middleware"));
-      if (!middleware.default) {
-        console.error(`❌ Middleware must export default: ${middlewarePath}`);
-        process.exit(1);
-      }
-      middlewares.set(pathname, middleware.default);
-    }
-
-    routeHandlers.set(pathname, routeModule.default);
-  }
-
-  console.log("✅ All route handlers loaded.");
-}
-
-await loadRoutes();
-
-function watchRoutes() {
-  const routesDir = path.join(process.cwd(), "routes");
-  const schemasDir = path.join(process.cwd(), "schemas");
-
-  watch(routesDir, { recursive: true }, async (_, filename) => {
-    if (!filename || !filename.endsWith(".ts")) return;
-
-    const routeName = filename.split("/")[0];
-    const routePath = path.join(routesDir, filename);
-
-    try {
-      const module = await import(bustModulePath(routePath, routeName));
-      if (module.default) routeHandlers.set(routeName, module.default);
-
-      const middlewarePath = path.join(routesDir, routeName, "middleware.ts");
-      if (await Bun.file(middlewarePath).exists()) {
-        const mw = await import(bustModulePath(middlewarePath, routeName + "-middleware"));
-        if (mw.default) middlewares.set(routeName, mw.default);
-      }
-
-      console.log(`🔁 Reloaded route/middleware: ${routeName}`);
-    } catch (e) {
-      console.error(`❌ Error reloading ${routeName}:`, e);
-    }
-  });
-
-  watch(schemasDir, { recursive: true }, async (_, filename) => {
-    if (!filename.endsWith("index.ts")) return;
-    const routeName = filename.split("/")[0];
-    const schemaPath = path.join(schemasDir, routeName, "index.ts");
-
-    try {
-      const schema = await import(bustModulePath(schemaPath, routeName + "-schema"));
-      if (schema.default) schemas.set(routeName, schema.default);
-      console.log(`✅ Reloaded schema: ${routeName}`);
-    } catch (e) {
-      console.error(`❌ Failed to reload schema for ${routeName}`, e);
-    }
-  });
-
-  console.log("👀 Watching routes and schemas...");
-}
-
-watchRoutes();
-
-const requestLogs: { context: Context; url: string }[] = [];
 const cache = new Cache();
 const db = new DatabaseService(pb, cache);
 
+// --- Server Configuration Builder ---
+async function createServeConfig(): Promise<Serve> {
+  console.log("🛠️ Building server configuration...");
+
+  const router = new FileSystemRouter({
+    style: "nextjs",
+    dir: path.join(process.cwd(), "routes"),
+  });
+  
+  const routeHandlers = new Map<string, (ctx: Context, db: DatabaseService) => Promise<Response>>();
+  const schemas = new Map();
+  const middlewares = new Map<string, (ctx: Context) => Promise<Response | boolean>>();
+
+  const reimportModule = async (modulePath: string) => {
+    const resolvedPath = require.resolve(modulePath);
+    if (require.cache[resolvedPath]) {
+      delete require.cache[resolvedPath];
+    }
+    return await import(`${pathToFileURL(modulePath).href}?t=${Date.now()}`);
+  };
+
+  for (const [pathname, routePath] of Object.entries(router.routes)) {
+    try {
+      const routeModule = await reimportModule(routePath as string);
+      if (routeModule.default) {
+        routeHandlers.set(pathname, routeModule.default);
+      }
+
+      const schemaPath = path.join(process.cwd(), "schemas", pathname, "index.ts");
+      if (await Bun.file(schemaPath).exists()) {
+        const schema = await reimportModule(schemaPath);
+        if (schema.default) schemas.set(pathname, schema.default);
+      }
+
+      const middlewarePath = path.join(path.dirname(routePath as string), "middleware.ts");
+      if (await Bun.file(middlewarePath).exists()) {
+          const middleware = await reimportModule(middlewarePath);
+          if (middleware.default) middlewares.set(pathname, middleware.default);
+      }
+    } catch (e) {
+        console.error(`❌ Error loading module for route ${pathname}:`, e);
+    }
+  }
+
+  console.log("✅ All modules loaded.");
+  
+  return {
+    port: config.port,
+    async fetch(req: Request) {
+      const url = new URL(req.url);
+      const routeMatch = router.match(url.href);
+      
+      if (!routeMatch) {
+          return new Response("404 Not Found", { status: 404 });
+      }
+
+      const routeHandler = routeHandlers.get(routeMatch.name);
+      const middleware = middlewares.get(routeMatch.name);
+      const schema = schemas.get(routeMatch.name);
+
+      if (!routeHandler) {
+        return new Response(`Route handler for ${routeMatch.name} not found.`, { status: 404 });
+      }
+      
+      try {
+        const context = await buildRequestContext(req, req.headers);
+        context.metadata.params = routeMatch.params;
+        context.metadata.query = routeMatch.query;
+        context.metadata.headers = Object.fromEntries(req.headers.entries());
+
+        if (middleware) {
+          const result = await middleware(context);
+          if (result instanceof Response) return result;
+          if (result === false) return new Response("Forbidden", { status: 403 });
+        }
+
+        if (schema) {
+          const validation = {
+            body: schema.body?.safeParse(context.metadata.json),
+            query: schema.query?.safeParse(context.metadata.query),
+            headers: schema.headers?.safeParse(context.metadata.headers),
+          };
+          for (const key of ["body", "query", "headers"] as const) {
+            if (validation[key] && !validation[key]?.success) {
+              return new Response(JSON.stringify({ success: false, error: validation[key]?.error.flatten() }), { status: 400, headers: { "Content-Type": "application/json" } });
+            }
+          }
+        }
+
+        return await routeHandler(context, db);
+      } catch (err) {
+        console.error(`❌ Error handling ${url.pathname}:`, err);
+        return new Response("Internal Server Error", { status: 500 });
+      }
+    },
+    error(error) {
+        console.error("☠️ Uncaught Error:", error);
+        return new Response("Something went wrong!", { status: 500 });
+    },
+  };
+}
+
+// --- Debounced File Watcher ---
+let reloadTimeout: Timer | null = null;
+function watchFiles() {
+  const watchDirs = [
+    path.join(process.cwd(), "routes"),
+    path.join(process.cwd(), "schemas")
+  ];
+
+  const triggerReload = (changeType: string, filename: string | null) => {
+    if (!filename) return;
+    if (reloadTimeout) clearTimeout(reloadTimeout);
+
+    reloadTimeout = setTimeout(async () => {
+        console.log(`\n🔁 Change detected in ${changeType}: ${filename}.`);
+        try {
+          const newConfig = await createServeConfig();
+          server.reload(newConfig);
+          console.log("✅ Server reloaded successfully.");
+        } catch(e) {
+            console.error("❌ Server reload failed:", e)
+        }
+    }, 100); // Debounce for 100ms
+  };
+
+  for (const dir of watchDirs) {
+      watch(dir, { recursive: true }, (changeType, filename) => triggerReload(changeType, filename));
+  }
+
+  console.log("👀 Watching for file changes in routes/ and schemas/...");
+}
+
+// --- Helper Functions ---
 function validateToken(token: string) {
   try {
     return jwt.verify(token, config.JWT_SECRET) as jwt.JwtPayload;
@@ -207,6 +242,9 @@ async function buildRequestContext(req: Request, headers: Headers): Promise<Cont
 
           return record;
         },
+        Roles: Array.isArray(primaryTenantData.Tenant_Roles)
+            ? primaryTenantData.Tenant_Roles
+            : [primaryTenantData.Tenant_Roles],
       },
     },
     metadata: {
@@ -234,80 +272,11 @@ async function buildRequestContext(req: Request, headers: Headers): Promise<Cont
     }
   }
 
-  context.services.Clover.Roles = Array.isArray(primaryTenantData.Tenant_Roles)
-    ? primaryTenantData.Tenant_Roles
-    : [primaryTenantData.Tenant_Roles];
-
   return context;
 }
 
-// --- Server Start ---
-const serverOptions: Serve = {
-  port: config.port,
-  async fetch(req: Request) {
-    const url = new URL(req.url);
-    router.reload();
-    const routeMatch = router.match(url.href);
-    const routeHandler = routeMatch ? routeHandlers.get(routeMatch.name) : undefined;
-    const middleware = routeMatch ? middlewares.get(routeMatch.name) : undefined;
-
-    if (!routeHandler) return new Response("404 Not Found", { status: 404 });
-
-    if (req.method.toLowerCase() !== routeHandler.name.toLowerCase()) {
-      return new Response(
-        JSON.stringify({
-          success: false,
-          error: `Method ${req.method} not allowed for ${routeHandler.name}`,
-        }),
-        { status: 405, headers: { "Content-Type": "application/json" } },
-      );
-    }
-
-    try {
-      const context = await buildRequestContext(req, req.headers);
-      context.metadata.params = routeMatch.params;
-      context.metadata.query = routeMatch.query;
-      context.metadata.headers = Object.fromEntries(req.headers.entries());
-
-      requestLogs.push({ url: routeMatch.name, context });
-      if (requestLogs.length > 1000) requestLogs.shift();
-
-      // Run middleware
-      if (middleware) {
-        const result = await middleware(context);
-        if (result instanceof Response) return result;
-        if (result === false) return new Response("Forbidden", { status: 403 });
-      }
-
-      // Run schema validation
-      const schema = schemas.get(routeMatch.name);
-      if (schema) {
-        const validation = {
-          body: schema.body?.safeParse(context.metadata.json),
-          query: schema.query?.safeParse(context.metadata.query),
-          headers: schema.headers?.safeParse(context.metadata.headers),
-        };
-
-        for (const key of ["body", "query", "headers"] as const) {
-          if (validation[key] && !validation[key]?.success) {
-            return new Response(
-              JSON.stringify({
-                success: false,
-                error: validation[key]?.error.flatten(),
-              }),
-              { status: 400, headers: { "Content-Type": "application/json" } },
-            );
-          }
-        }
-      }
-
-      return await routeHandler(context, db);
-    } catch (err) {
-      console.error(`❌ Error handling ${url.pathname}:`, err);
-      return new Response("Internal Server Error", { status: 500 });
-    }
-  },
-};
-
-serve(serverOptions);
-console.log(`🚀 Hapta listening at http://localhost:${serverOptions.port}`);
+// --- Initial Server Start ---
+server = Bun.serve(await createServeConfig());
+console.log(`🚀 Hapta listening at http://localhost:${server.port}`);
+watchFiles();
+ 
