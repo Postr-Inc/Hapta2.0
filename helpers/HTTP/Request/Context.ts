@@ -167,8 +167,7 @@ export default class Context implements IContext {
     return Response.json(value, {
       status,
       headers: {
-        "Content-Type": "application/json",
-        // Add any other default headers like CORS here
+        "Content-Type": "application/json", 
       }
     });
   }
