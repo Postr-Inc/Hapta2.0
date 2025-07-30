@@ -1,7 +1,15 @@
+import { config } from "../../../src/core/config";
+const corsHeaders = {
+  "Access-Control-Allow-Origin": config.origin,
+  "Access-Control-Allow-Methods": "OPTIONS, GET, POST, PUT, PATCH, DELETE",
+  "Access-Control-Allow-Headers": "Content-Type, Authorization",
+};
+
 /**
  * A discriminated union to safely represent the authenticated actor.
  * The state is either fully authenticated or explicitly not.
  */
+
 export type AuthenticatedPrincipal = {
   isAuthenticated: true;
   id: string; // The unique ID of the actor from Clover
@@ -168,6 +176,7 @@ export default class Context implements IContext {
       status,
       headers: {
         "Content-Type": "application/json", 
+        ...corsHeaders
       }
     });
   }
@@ -179,7 +188,8 @@ export default class Context implements IContext {
     return new Response(value, {
       status,
       headers: {
-        "Content-Type": "text/html",
+        "Content-Type": "text/html", 
+        ...corsHeaders
       }
     });
   }
@@ -192,6 +202,7 @@ export default class Context implements IContext {
       status,
       headers: {
         "Content-Type": "text/plain",
+        ...corsHeaders
       }
     });
   }
