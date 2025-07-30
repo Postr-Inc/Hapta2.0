@@ -43,6 +43,15 @@ type MfaAuthOptions = {
     mfaCode: string;
 };
 
+type OAuthAuthOptions = {
+  type: 'oauth';
+  code: string;
+  redirectUri: string | null;
+  authenticated_id: string;
+  accessToken?: string; // token received from Clover OAuth flow
+};
+
+
 type OtpAuthOptions = {
     type: 'otp';
     email: string;
@@ -50,27 +59,29 @@ type OtpAuthOptions = {
 };
 
 // Create a union of all possible authentication methods
-type AuthOptions = PasswordAuthOptions | MfaAuthOptions | OtpAuthOptions;
+type AuthOptions = PasswordAuthOptions | MfaAuthOptions | OtpAuthOptions | OAuthAuthOptions;
 
 // Define the final function type
 // (Assuming it returns a Promise with the Principal type from our previous discussions)
 type AuthenticateFn = (options: AuthOptions) => Promise<Principal>;
+type RegisterFn = (data: any ) => Promise<boolean>
 type TokenOptions = {
   payload: {
      id: string, 
   },
   iat: number
 } 
+type VerifyFn = (token: string) => Promise<Principal>;
+ 
 export type ServiceConfigs = {
   Clover: {
-    /**
-     * Organizations Tenant ID
-     */
-    Tenant_ID: string 
-    Roles?: {name: string, security_level: Number}[]
-    Authorized_Users: string[],
-    Authenticate: AuthenticateFn, 
-  }; 
+    Tenant_ID: string;
+    Roles?: { name: string; security_level: number }[];
+    Authorized_Users: string[];
+    Authenticate: AuthenticateFn; 
+    Register: RegisterFn;
+    Verify?: VerifyFn;            // just verify token
+  };
 };
 
 // ---
@@ -86,7 +97,7 @@ export type RequestMetadata = {
   userAgent?: string;
   body: any,
   json: {},
-  headers:  Headers;
+  headers:  Headers | {};
   query:{},
   params: {}
 };
@@ -96,7 +107,7 @@ export type RequestMetadata = {
 /**
  * The main application context, redesigned for clarity.
  */
-export default interface Context {
+interface IContext {
   /**
    * The authenticated user or system actor for this request,
    * populated by the Clover authentication backend.
@@ -124,4 +135,65 @@ export default interface Context {
    * @prop json 
    */
   metadata: RequestMetadata;
+  json: (value: any, status?: number, statusText?:string) => Response
+  html: (value: string, status?: number, statusText?:string) => Response
+  text: (value: string, status?: number, statusText?:string) => Response
+}
+ 
+export default class Context implements IContext {
+  public principal: Principal;
+  public services: ServiceConfigs;
+  public tenantId?: string;
+  public metadata: RequestMetadata;
+
+  constructor() {
+    // Initialize with default/empty values
+    this.principal = { isAuthenticated: false };
+    this.services = {} as ServiceConfigs; // Cast as empty, to be populated by the builder
+    this.metadata = {
+      requestID: '',
+      timestamp: new Date(),
+      json: {},
+      headers: {},
+      query: {},
+      params: {}
+    };
+  }
+
+  /**
+   * Helper method to create a JSON response.
+   */
+  json(value: any, status: number = 200): Response {
+    return Response.json(value, {
+      status,
+      headers: {
+        "Content-Type": "application/json",
+        // Add any other default headers like CORS here
+      }
+    });
+  }
+
+  /**
+   * Helper method to create an HTML response.
+   */
+  html(value: string, status: number = 200): Response {
+    return new Response(value, {
+      status,
+      headers: {
+        "Content-Type": "text/html",
+      }
+    });
+  }
+
+  /**
+   * Helper method to create a plain text response.
+   */
+  text(value: string, status: number = 200): Response {
+    return new Response(value, {
+      status,
+      headers: {
+        "Content-Type": "text/plain",
+      }
+    });
+  }
 }
